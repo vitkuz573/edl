@@ -136,6 +136,11 @@ class sahara(metaclass=LogBase):
                 elif v[0] == 0x7E:
                     return {"mode": "nandprg"}
             else:
+                last_usb_error = str(getattr(self.cdc, "last_error", "")).lower()
+                if "_usb_reap_async" in last_usb_error or "claim_interface" in last_usb_error or \
+                        "resource busy" in last_usb_error:
+                    self.debug(f"Fast-fail Sahara connect due to USB backend error: {last_usb_error}")
+                    return {"mode": "error"}
                 # Some targets get stuck between sessions and stop sending HELLO_REQ
                 # until the Sahara state machine is reset. This does not reboot target.
                 for _ in range(3):

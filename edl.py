@@ -207,12 +207,34 @@ class main(metaclass=LogBase):
                 options[arg] = rargs[arg]
         return options
 
+    @staticmethod
+    def _is_usb_busy_error(err) -> bool:
+        errmsg = str(err).lower()
+        usb_busy_markers = [
+            "claim_interface",
+            "resource busy",
+            "device or resource busy",
+            "another process has claimed this interface",
+            "access denied",
+            "usberror",
+        ]
+        return any(marker in errmsg for marker in usb_busy_markers)
+
     def doconnect(self, loop) -> dict:
         handshake_failures = 0
+        max_failures = 3
         while True:
             if not self.cdc.connected:
                 self.cdc.connected = self.cdc.connect(portname=self.portname)
             if not self.cdc.connected:
+                if self._is_usb_busy_error(getattr(self.cdc, "last_error", "")):
+                    handshake_failures += 1
+                    self.warning(f"USB interface is busy, retry {handshake_failures}/{max_failures}.")
+                    if handshake_failures >= max_failures:
+                        self.error("Couldn't claim USB interface after multiple attempts. Close other tools and re-enter EDL.")
+                        return {"mode": "error"}
+                    time.sleep(0.3)
+                    continue
                 sys.stdout.write('.')
                 if loop == 5:
                     sys.stdout.write('\n')
@@ -236,16 +258,23 @@ class main(metaclass=LogBase):
                 self.vid = self.cdc.vid
                 self.pid = self.cdc.pid
             except Exception as err:  # pylint: disable=broad-except
-                self.warning(f"Sahara handshake failed, retrying: {err}")
+                handshake_failures += 1
+                if self._is_usb_busy_error(err):
+                    self.error(f"USB interface is busy: {err}")
+                else:
+                    self.warning(f"Sahara handshake failed, retrying: {err}")
                 self.cdc.close()
                 self.cdc.connected = False
+                if handshake_failures >= max_failures:
+                    self.error("Sahara handshake failed repeatedly. Re-enter EDL and retry.")
+                    return {"mode": "error"}
                 continue
             if "mode" in resp:
                 mode = resp["mode"]
                 if mode == "error":
                     self.warning("Temporary Sahara error state, retrying connection...")
                     handshake_failures += 1
-                    if handshake_failures >= 6:
+                    if handshake_failures >= max_failures:
                         self.error("Sahara handshake failed repeatedly. Re-enter EDL and retry.")
                         return {"mode": "error"}
                     continue
@@ -255,7 +284,7 @@ class main(metaclass=LogBase):
 
             self.warning("Handshake returned no mode, retrying device connection...")
             handshake_failures += 1
-            if handshake_failures >= 6:
+            if handshake_failures >= max_failures:
                 self.error("No valid response from target after multiple attempts. Re-enter EDL and retry.")
                 return {"mode": "error"}
             time.sleep(0.2)

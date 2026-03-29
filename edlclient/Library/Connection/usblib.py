@@ -70,6 +70,7 @@ class usb_class(DeviceClass):
     def __init__(self, loglevel=logging.INFO, portconfig=None, devclass=-1, serial_number=None):
         super().__init__(loglevel, portconfig, devclass)
         self.serial_number = serial_number
+        self.last_error = ""
         self.load_windows_dll()
         self.EP_IN = None
         self.EP_OUT = None
@@ -220,6 +221,7 @@ class usb_class(DeviceClass):
         if self.connected:
             self.close()
             self.connected = False
+        self.last_error = ""
         self.device = None
         self.EP_OUT = None
         self.EP_IN = None
@@ -287,8 +289,15 @@ class usb_class(DeviceClass):
 
             try:
                 usb.util.claim_interface(self.device, 0)
-            except:
-                pass
+            except Exception as err:
+                self.last_error = str(err)
+                self.error(f"USB interface claim failed: {err}")
+                try:
+                    usb.util.dispose_resources(self.device)
+                except Exception:
+                    pass
+                self.connected = False
+                return False
             """
             self.debug(self.configuration)
             if self.interface != 0:
@@ -327,21 +336,40 @@ class usb_class(DeviceClass):
         return False
 
     def close(self, reset=False):
-        if self.connected:
-            try:
-                if reset:
-                    self.device.reset()
-                if not self.device.is_kernel_driver_active(self.interface):
-                    # self.device.attach_kernel_driver(self.interface) #Do NOT uncomment
-                    self.device.attach_kernel_driver(0)
-            except Exception as err:
-                self.debug(str(err))
-                pass
-            usb.util.dispose_resources(self.device)
-            del self.device
+        if not self.connected:
+            return
+        try:
             if reset:
-                time.sleep(2)
-            self.connected = False
+                self.device.reset()
+        except Exception as err:
+            self.debug(str(err))
+        interface_number = 0
+        try:
+            interface_number = self.interface.bInterfaceNumber
+        except Exception:
+            try:
+                interface_number = int(self.interface)
+            except Exception:
+                interface_number = 0
+        for idx in (interface_number, 0):
+            try:
+                usb.util.release_interface(self.device, idx)
+            except Exception:
+                pass
+        try:
+            if not self.device.is_kernel_driver_active(interface_number):
+                # self.device.attach_kernel_driver(interface_number) #Do NOT uncomment
+                self.device.attach_kernel_driver(0)
+        except Exception as err:
+            self.debug(str(err))
+        try:
+            usb.util.dispose_resources(self.device)
+        except Exception:
+            pass
+        self.device = None
+        if reset:
+            time.sleep(2)
+        self.connected = False
 
     def write(self, command, pktsize=None):
         if pktsize is None:
@@ -372,6 +400,7 @@ class usb_class(DeviceClass):
                         self.info(ctr)
                     pos += pktsize
                 except Exception as err:
+                    self.last_error = str(err)
                     self.debug(str(err))
                     # print("Error while writing")
                     # time.sleep(0.01)
@@ -408,6 +437,7 @@ class usb_class(DeviceClass):
                     break
             except usb.core.USBError as e:
                 error = str(e.strerror)
+                self.last_error = error
                 if "timed out" in error:
                     if len(res) > 0:
                         break
@@ -420,6 +450,8 @@ class usb_class(DeviceClass):
                     self.info(repr(e))
                     return b""
 
+        if len(res) > 0:
+            self.last_error = ""
         if loglevel == logging.DEBUG:
             self.debug(inspect.currentframe().f_back.f_code.co_name + ":" + hex(len(res)))
             if self.loglevel == logging.DEBUG and len(res) > 0:
