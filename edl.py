@@ -270,6 +270,20 @@ class main(metaclass=LogBase):
         else:
             sys.exit(status)
 
+    def reset_target_to_edl(self, cmd: str):
+        # On some Windows/libusb setups the next session fails unless target is
+        # explicitly returned to EDL after each firehose operation.
+        if self.serial:
+            return
+        if cmd in ["", "server", "reset"]:
+            return
+        try:
+            self.info("Returning target to EDL for next command ...")
+            self.fh.firehose.cmd_reset("edl")
+            time.sleep(1.0)
+        except Exception as err:  # pylint: disable=broad-except
+            self.warning(f"Couldn't reset target to EDL automatically: {err}")
+
     def run(self):
         if is_windows():
             proper_driver = self.console_cmd(r'reg query HKLM\HARDWARE\DEVICEMAP\SERIALCOMM')
@@ -433,7 +447,9 @@ class main(metaclass=LogBase):
                 if self.fh.connect(sahara):
                     if self.imported:
                         return self.exit(cdc_close=False)
-                    elif not self.fh.handle_firehose(cmd, options):
+                    command_ok = self.fh.handle_firehose(cmd, options)
+                    self.reset_target_to_edl(cmd)
+                    if not command_ok:
                         return self.exit(1)
                 else:
                     return self.exit(1)
