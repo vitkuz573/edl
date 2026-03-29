@@ -208,8 +208,10 @@ class main(metaclass=LogBase):
         return options
 
     def doconnect(self, loop) -> dict:
-        while not self.cdc.connected:
-            self.cdc.connected = self.cdc.connect(portname=self.portname)
+        handshake_failures = 0
+        while True:
+            if not self.cdc.connected:
+                self.cdc.connected = self.cdc.connect(portname=self.portname)
             if not self.cdc.connected:
                 sys.stdout.write('.')
                 if loop == 5:
@@ -226,19 +228,37 @@ class main(metaclass=LogBase):
                 loop += 1
                 time.sleep(1)
                 sys.stdout.flush()
-            else:
-                self.info("Device detected :)")
-                try:
-                    resp = self.sahara.connect()
-                    self.vid = self.cdc.vid
-                    self.pid = self.cdc.pid
-                except Exception as err:  # pylint: disable=broad-except
-                    self.debug(str(err))
+                continue
+
+            self.info("Device detected :)")
+            try:
+                resp = self.sahara.connect()
+                self.vid = self.cdc.vid
+                self.pid = self.cdc.pid
+            except Exception as err:  # pylint: disable=broad-except
+                self.warning(f"Sahara handshake failed, retrying: {err}")
+                self.cdc.close()
+                self.cdc.connected = False
+                continue
+            if "mode" in resp:
+                mode = resp["mode"]
+                if mode == "error":
+                    self.warning("Temporary Sahara error state, retrying connection...")
+                    handshake_failures += 1
+                    if handshake_failures >= 6:
+                        self.error("Sahara handshake failed repeatedly. Re-enter EDL and retry.")
+                        return {"mode": "error"}
                     continue
-                if "mode" in resp:
-                    mode = resp["mode"]
-                    self.info(f"Mode detected: {mode}")
-                    return resp
+                handshake_failures = 0
+                self.info(f"Mode detected: {mode}")
+                return resp
+
+            self.warning("Handshake returned no mode, retrying device connection...")
+            handshake_failures += 1
+            if handshake_failures >= 6:
+                self.error("No valid response from target after multiple attempts. Re-enter EDL and retry.")
+                return {"mode": "error"}
+            time.sleep(0.2)
         return {"mode": "error"}
 
     def exit(self, status: int = 0, cdc_close: bool = True):
@@ -346,23 +366,37 @@ class main(metaclass=LogBase):
                                         print("Error, couldn't find suitable enprg/nprg loader :(")
                                         return self.exit()
                     else:
-                        sahara_info = self.sahara.cmd_info(version=version)
-                        if sahara_info is not None:
-                            resp = self.sahara.connect()
-                            mode = resp["mode"]
-                            if "data" in resp:
-                                data = resp["data"]
-                            if mode == "sahara":
-                                mode = self.sahara.upload_loader(version=version)
+                        if self.args["--loader"] != 'None':
+                            # Explicit loader was provided by user, skip cmd_info command-mode
+                            # probing and directly start Sahara image transfer.
+                            mode = self.sahara.upload_loader(version=version)
+                            if mode == "":
+                                self.error("Loader upload didn't start or wasn't accepted by target.")
+                                return self.exit(1)
                         else:
-                            print("Error on sahara handshake, resetting.")
-                            self.sahara.cmd_reset()
-                            return self.exit(1)
+                            sahara_info = self.sahara.cmd_info(version=version)
+                            if sahara_info:
+                                resp = self.sahara.connect()
+                                mode = resp["mode"]
+                                if "data" in resp:
+                                    data = resp["data"]
+                                if mode == "sahara":
+                                    mode = self.sahara.upload_loader(version=version)
+                                    if mode == "":
+                                        self.error("Autodetection failed: no loader selected or loader upload didn't start.")
+                                        self.info("Hint: run again with --loader=<path-to-firehose-loader> (no reset sent).")
+                                        return self.exit(1)
+                            else:
+                                self.error("Error on sahara handshake.")
+                                return self.exit(1)
         else:
             if self.__logger.level != logging.DEBUG:
                 self.__logger.setLevel(logging.ERROR)
         if mode == "error":
             print("Connection detected, quiting.")
+            return self.exit(1)
+        elif mode == "":
+            self.error("No valid mode after Sahara stage. Please provide --loader explicitly.")
             return self.exit(1)
         elif mode == "firehose":
             if "enprg" in self.sahara.programmer.lower():

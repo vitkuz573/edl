@@ -113,7 +113,12 @@ class sahara(metaclass=LogBase):
 
     def connect(self):
         try:
-            v = self.cdc.read(length=0xC * 0x4, timeout=1)
+            # DeviceClass.timeout is handled in different units by backends:
+            # usb backend expects milliseconds, serial backend expects seconds.
+            timeout = self.cdc.timeout
+            if timeout is not None and getattr(self.cdc, "is_serial", False):
+                timeout = max(1, int(timeout / 1000))
+            v = self.cdc.read(length=0xC * 0x4, timeout=timeout)
             if len(v) > 1:
                 if v[0] == 0x01:
                     pkt = self.ch.pkt_cmd_hdr(v)
@@ -131,6 +136,39 @@ class sahara(metaclass=LogBase):
                 elif v[0] == 0x7E:
                     return {"mode": "nandprg"}
             else:
+                # Some targets get stuck between sessions and stop sending HELLO_REQ
+                # until the Sahara state machine is reset. This does not reboot target.
+                for _ in range(3):
+                    try:
+                        self.cmd_reset_state_machine()
+                        time.sleep(0.1)
+                        v = self.cdc.read(length=0xC * 0x4, timeout=max(timeout or 0, 2000))
+                        if len(v) <= 1:
+                            continue
+                        if v[0] == 0x01:
+                            pkt = self.ch.pkt_cmd_hdr(v)
+                            if pkt.cmd == cmd_t.SAHARA_HELLO_REQ:
+                                rsp = self.ch.pkt_hello_req(v)
+                                self.pktsize = rsp.cmd_packet_length
+                                self.version = rsp.version
+                                self.info(f"Protocol version: {rsp.version}, Version supported: {rsp.version_supported}")
+                                return {"mode": "sahara", "cmd": cmd_t.SAHARA_HELLO_REQ, "data": rsp}
+                            elif pkt.cmd == cmd_t.SAHARA_END_TRANSFER:
+                                rsp = self.ch.pkt_image_end(v)
+                                return {"mode": "sahara", "cmd": cmd_t.SAHARA_END_TRANSFER, "data": rsp}
+                        elif b"<?xml" in v:
+                            return {"mode": "firehose"}
+                        elif v[0] == 0x7E:
+                            return {"mode": "nandprg"}
+                    except Exception as e:  # pylint: disable=broad-except
+                        self.debug(f"Sahara state-machine reset probe failed: {e}")
+                        continue
+
+                # On EDL 9008, avoid random probe packets that can push target
+                # into deeper error states. Let caller reconnect/retry.
+                if self.cdc.pid == 0x9008:
+                    return {"mode": "error"}
+
                 data = b"<?xml version=\"1.0\" ?><data><nop /></data>"
                 self.cdc.write(data)
                 res = self.cdc.read(timeout=1)
@@ -142,15 +180,6 @@ class sahara(metaclass=LogBase):
                     elif res[0] == cmd_t.SAHARA_END_TRANSFER:
                         rsp = self.ch.pkt_image_end(res)
                         return {"mode": "sahara", "cmd": cmd_t.SAHARA_END_TRANSFER, "data": rsp}
-                elif res == b"":
-                    data = b"\x7E\x11\x00\x12\x00\xA0\xE3\x00\x00\xC1\xE5\x01\x40\xA0\xE3\x1E\xFF\x2F\xE1\x4B\xD9\x7E"
-                    self.cdc.write(data)
-                    res = self.cdc.read()
-                    if len(res) > 0 and res[1] == 0x12:
-                        return {"mode": "nandprg"}
-                    elif len(res) == 0:
-                        print("Device is in Sahara error state, please reboot the device.")
-                        return {"mode": "error"}
 
         except Exception as e:  # pylint: disable=broad-except
             self.error(str(e))
@@ -631,6 +660,9 @@ class sahara(metaclass=LogBase):
     def upload_loader(self, version):
         if self.programmer == "":
             return ""
+        old_timeout = self.cdc.timeout
+        if old_timeout is not None and old_timeout < 5000:
+            self.cdc.timeout = 5000
         try:
             self.info(f"Uploading loader {self.programmer} ...")
             with open(self.programmer, "rb") as rf:
@@ -711,6 +743,8 @@ class sahara(metaclass=LogBase):
         except Exception as e:  # pylint: disable=broad-except
             self.error("Unexpected error on uploading, maybe signature of loader wasn't accepted ?\n" + str(e))
             return ""
+        finally:
+            self.cdc.timeout = old_timeout
         return self.mode
 
     def cmd_modeswitch(self, mode):

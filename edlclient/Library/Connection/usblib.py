@@ -88,6 +88,12 @@ class usb_class(DeviceClass):
 
     def load_windows_dll(self):
         if os.name == 'nt':
+            # On modern Python/Windows setups, forcing bundled libusb DLLs can
+            # trigger access-violation crashes during interpreter shutdown.
+            # Prefer system-installed USB stack by default.
+            use_bundled = os.environ.get("EDL_USE_BUNDLED_USB_DLLS", "0").lower() in ("1", "true", "yes")
+            if not use_bundled:
+                return
             windows_dir = None
             try:
                 # add pygame folder to Windows DLL search paths
@@ -385,25 +391,28 @@ class usb_class(DeviceClass):
             self.info("Warning !")
         res = bytearray()
         loglevel = self.loglevel
-        buffer = self.buffer[:resplen]
         epr = self.EP_IN.read
         extend = res.extend
         while len(res) < resplen:
             try:
-                resplen = epr(buffer, timeout)
-                extend(buffer[:resplen])
-                if resplen == self.EP_IN.wMaxPacketSize:
+                to_read = resplen - len(res)
+                # Integer-size read is more reliable on Windows libusb0/libusb-win32
+                # than passing a preallocated python buffer object.
+                chunk = epr(to_read, timeout)
+                rlen = len(chunk)
+                if rlen == 0:
+                    break
+                extend(chunk)
+                # Short packet means transfer completed for this transaction.
+                if rlen < self.EP_IN.wMaxPacketSize:
                     break
             except usb.core.USBError as e:
                 error = str(e.strerror)
                 if "timed out" in error:
-                    if timeout is None:
-                        return b""
+                    if len(res) > 0:
+                        break
                     self.debug("Timed out")
-                    if timeout == 10:
-                        return b""
-                    timeout += 1
-                    pass
+                    return b""
                 elif "Overflow" in error:
                     self.error("USB Overflow")
                     return b""
@@ -412,10 +421,10 @@ class usb_class(DeviceClass):
                     return b""
 
         if loglevel == logging.DEBUG:
-            self.debug(inspect.currentframe().f_back.f_code.co_name + ":" + hex(resplen))
-            if self.loglevel == logging.DEBUG:
-                self.verify_data(res[:resplen], "RX:")
-        return res[:resplen]
+            self.debug(inspect.currentframe().f_back.f_code.co_name + ":" + hex(len(res)))
+            if self.loglevel == logging.DEBUG and len(res) > 0:
+                self.verify_data(res, "RX:")
+        return res
 
     def ctrl_transfer(self, bmRequestType, bRequest, wValue, wIndex, data_or_wLength):
         ret = self.device.ctrl_transfer(bmRequestType=bmRequestType, bRequest=bRequest, wValue=wValue, wIndex=wIndex,

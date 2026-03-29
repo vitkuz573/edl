@@ -41,9 +41,11 @@ class generic(metaclass=LogBase):
             if self.fh.cmd_patch(lun, sector, offset, value, size_in_bytes, True):
                 print(f"Patched sector {str(rpartition.sector)}, offset {str(offset)} with value {value}, " +
                       f"size in bytes {size_in_bytes}.")
+                return True
             else:
                 print(f"Error on writing sector {str(rpartition.sector)}, offset {str(offset)} with value {value}, " +
                       f"size in bytes {size_in_bytes}.")
+                return False
         else:
             """
             #define DEVICE_MAGIC "ANDROID-BOOT!"
@@ -97,8 +99,12 @@ class generic(metaclass=LogBase):
                         print(
                             f"Patched sector {str(rpartition.sector)}, offset {str(offset1)} with value {value}, " +
                             f"size in bytes {size_in_bytes}.")
-                        data = self.fh.cmd_read_buffer(lun, rpartition.sector, rpartition.sectors)
-                        if (len(data) > 0x7FFE20) and data[0x7FFE00:0x7FFE10] == b"ANDROID-BOOT!\x00\x00\x00":
+                        read_resp = self.fh.cmd_read_buffer(lun, rpartition.sector, rpartition.sectors)
+                        data = read_resp
+                        if hasattr(read_resp, "data"):
+                            data = read_resp.data
+                        if isinstance(data, (bytes, bytearray)) and \
+                                (len(data) > 0x7FFE20) and data[0x7FFE00:0x7FFE10] == b"ANDROID-BOOT!\x00\x00\x00":
                             if self.fh.cmd_patch(lun, sector3, offset3, value, size_in_bytes, True):
                                 if self.fh.cmd_patch(lun, sector4, offset4, value, size_in_bytes, True):
                                     print(
@@ -118,3 +124,4 @@ class generic(metaclass=LogBase):
                             self.error("\t" + rpartition)
                         else:
                             self.error(lun + ":\t" + rpartition)
+        return False
