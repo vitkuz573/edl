@@ -438,12 +438,13 @@ class usb_class(DeviceClass):
             except usb.core.USBError as e:
                 error = str(e.strerror)
                 self.last_error = error
-                if "timed out" in error:
+                error_lower = error.lower()
+                if "timed out" in error_lower or "timeout error" in error_lower:
                     if len(res) > 0:
                         break
                     self.debug("Timed out")
                     return b""
-                elif "Overflow" in error:
+                elif "overflow" in error_lower:
                     self.error("USB Overflow")
                     return b""
                 else:

@@ -733,7 +733,7 @@ class firehose(metaclass=LogBase):
 
         progbar = progress(self.cfg.SECTOR_SIZE_IN_BYTES)
         rsp = self.xmlsend(data, self.skipresponse)
-        if "value" in rsp.data and rsp.data["value"] == "NAK":
+        if isinstance(rsp.data, dict) and rsp.data.get("value") == "NAK":
             return rsp
         self.cdc.xmlread = False
         resData = bytearray()
@@ -1159,9 +1159,18 @@ class firehose(metaclass=LogBase):
         else:
             self.cdc.timeout = 50
         info = []
+        idle_reads = 0
+        max_idle_reads = 8
+        read_timeout = self.cdc.timeout if self.cdc.timeout is not None else 100
         while v != b'':
             try:
-                v = self.cdc.read(timeout=None)
+                v = self.cdc.read(timeout=read_timeout)
+                if v == b'':
+                    idle_reads += 1
+                    if idle_reads >= max_idle_reads:
+                        break
+                    continue
+                idle_reads = 0
                 if (b"response" in v and b"</data>" in v) or v == b'':
                     break
                 data = self.xml.getlog(v)

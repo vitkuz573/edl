@@ -134,6 +134,7 @@ import re
 import subprocess
 import sys
 import time
+from threading import Thread
 
 from docopt import docopt
 
@@ -300,8 +301,12 @@ class main(metaclass=LogBase):
             sys.exit(status)
 
     def reset_target_to_edl(self, cmd: str):
-        # On some Windows/libusb setups the next session fails unless target is
-        # explicitly returned to EDL after each firehose operation.
+        # Optional compatibility path for hosts where the next session fails
+        # unless target is explicitly reset. Disabled by default because many
+        # loaders interpret power/reset as normal reboot to OS.
+        auto_reset = os.environ.get("EDL_AUTORESET_TO_EDL", "0").lower() in ("1", "true", "yes")
+        if not auto_reset:
+            return
         if self.serial:
             return
         if cmd in ["", "server", "reset"]:
@@ -312,6 +317,33 @@ class main(metaclass=LogBase):
             time.sleep(1.0)
         except Exception as err:  # pylint: disable=broad-except
             self.warning(f"Couldn't reset target to EDL automatically: {err}")
+
+    def connect_firehose_with_timeout(self, timeout_sec: float = 12.0) -> bool:
+        status = {"done": False, "ok": False, "err": None}
+
+        def _worker():
+            try:
+                status["ok"] = self.fh.connect(sahara)
+            except Exception as err:  # pylint: disable=broad-except
+                status["err"] = err
+            finally:
+                status["done"] = True
+
+        thread = Thread(target=_worker, daemon=True)
+        thread.start()
+        thread.join(timeout_sec)
+        if not status["done"]:
+            self.error(f"Direct firehose reconnect timed out after {timeout_sec:.0f}s.")
+            try:
+                self.cdc.close()
+            except Exception:  # pylint: disable=broad-except
+                pass
+            self.cdc.connected = False
+            return False
+        if status["err"] is not None:
+            self.error(f"Direct firehose reconnect failed: {status['err']}")
+            return False
+        return status["ok"]
 
     def run(self):
         if is_windows():
@@ -367,6 +399,7 @@ class main(metaclass=LogBase):
         self.cdc.timeout = 1500
         conninfo = self.doconnect(loop)
         mode = conninfo["mode"]
+        cmd = self.parse_cmd(self.args)
         try:
             version = conninfo.get("data").version
         except AttributeError:
@@ -436,6 +469,32 @@ class main(metaclass=LogBase):
             if self.__logger.level != logging.DEBUG:
                 self.__logger.setLevel(logging.ERROR)
         if mode == "error":
+            # If Sahara handshake fails but target is still in firehose from a
+            # previous session, try direct firehose reconnect before bailing out.
+            if cmd not in ["", "server"] and self.args["--loader"] != 'None':
+                self.warning("Sahara handshake failed, trying direct firehose reconnect ...")
+                try:
+                    self.cdc.close()
+                except Exception:  # pylint: disable=broad-except
+                    pass
+                self.cdc.connected = False
+                time.sleep(0.2)
+                self.cdc.connected = self.cdc.connect(portname=self.portname)
+                if not self.cdc.connected:
+                    self.error("Direct firehose reconnect failed: couldn't reopen USB interface.")
+                    print("Connection detected, quiting.")
+                    return self.exit(1)
+                self.cdc.timeout = None
+                self.fh = firehose_client(self.args, self.cdc, self.sahara, self.__logger.level, print)
+                options = self.parse_option(self.args)
+                if self.connect_firehose_with_timeout():
+                    if self.imported:
+                        return self.exit(cdc_close=False)
+                    command_ok = self.fh.handle_firehose(cmd, options)
+                    self.reset_target_to_edl(cmd)
+                    if not command_ok:
+                        return self.exit(1)
+                    return self.exit()
             print("Connection detected, quiting.")
             return self.exit(1)
         elif mode == "":
@@ -465,7 +524,6 @@ class main(metaclass=LogBase):
             sc.handle_streaming(cmd, options)
         else:
             self.cdc.timeout = None
-            cmd = self.parse_cmd(self.args)
             if cmd == 'provision':
                 self.args["--memory"] = 'ufs'
                 self.args["--skipstorageinit"] = 1

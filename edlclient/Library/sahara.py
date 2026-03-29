@@ -137,8 +137,8 @@ class sahara(metaclass=LogBase):
                     return {"mode": "nandprg"}
             else:
                 last_usb_error = str(getattr(self.cdc, "last_error", "")).lower()
-                if "_usb_reap_async" in last_usb_error or "claim_interface" in last_usb_error or \
-                        "resource busy" in last_usb_error:
+                if "claim_interface" in last_usb_error or "resource busy" in last_usb_error or \
+                        "access denied" in last_usb_error:
                     self.debug(f"Fast-fail Sahara connect due to USB backend error: {last_usb_error}")
                     return {"mode": "error"}
                 # Some targets get stuck between sessions and stop sending HELLO_REQ
@@ -168,11 +168,6 @@ class sahara(metaclass=LogBase):
                     except Exception as e:  # pylint: disable=broad-except
                         self.debug(f"Sahara state-machine reset probe failed: {e}")
                         continue
-
-                # On EDL 9008, avoid random probe packets that can push target
-                # into deeper error states. Let caller reconnect/retry.
-                if self.cdc.pid == 0x9008:
-                    return {"mode": "error"}
 
                 data = b"<?xml version=\"1.0\" ?><data><nop /></data>"
                 self.cdc.write(data)
